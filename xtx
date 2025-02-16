@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+import asyncio
+import hashlib
+import logging
+from datetime import datetime, timedelta, timezone
+import dc_api  # dc_api 모듈이 설치되어 있어야 합니다.
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import os
+import sys
+import json
+
+# 전역 로그 버퍼 (로그 창에 표시할 메시지를 저장)
+LOG_BUFFER = []
+LOG_BUFFER_LOCK = threading.Lock()  # 로그 버퍼 동기화용 락
+
+#############################################
+# GuiLogHandler: 로그를 전역 버퍼에 저장
+#############################################
+class GuiLogHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            with LOG_BUFFER_LOCK:
+                LOG_BUFFER.append(msg)
+        except Exception:
+            self.handleError(record)
+
+# 로깅 설정 (INFO 레벨 이상 출력)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+logging.getLogger().addHandler(GuiLogHandler())
+
+#############################################
+# JSON 직렬화/역직렬화 헬퍼 함수들
+#############################################
+def serialize(obj):
+    if isinstance(obj, datetime):
+        return {"__type__": "datetime", "value": obj.isoformat()}
+    elif isinstance(obj, set):
+        return {"__type__": "set", "value": list(obj)}
+    elif isinstance(obj, dict):
+        return {k: serialize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [serialize(v) for v in obj]
+    else:
+        return obj
+
+def custom_object_hook(dct):
+    if "__type__" in dct:
+        if dct["__type__"] == "datetime":
+            return datetime.fromisoformat(dct["value"])
+        elif dct["__type__"] == "set":
+            return set(dct["value"])
+    return dct
+
+def save_json_data(file_path: str, data: dict) -> None:
+    with open(file_path, "w", encoding="utf-8") as fw:
+        json.dump(serialize(data), fw, ensure_ascii=False, indent=4)
+
+def load_json_data(file_path: str) -> dict:
+    with open(file_path, "r", encoding="utf-8") as fr:
+        return json.load(fr, object_hook=custom_object_hook)
+
+#############################################
+# Helper function: 창을 화면 중앙에 배치
+#############################################
+def center_window(win, width, height):
+    win.update_idletasks()
+    screen_width = win.winfo_screenwidth()
+    screen_height = win.winfo_screenheight()
+    x = (screen_width - width) // 2
+    y = (screen_height - height) // 2
+    win.geometry(f"{width}x{height}+{x}+{y}")
+
+#############################################
+# DCCrawler 클래스 (비동기 크롤링 관련 기능)
+#############################################
+class DCCrawler:
+    def __init__(self):
+        self.progress_status = {
+            "global_count": 0,
+            "current_doc_time": None,
+            "current_doc_title": None,
+            "start_time": None,
+            "final_elapsed": None,
+            "last_message": "",
+            "board_display": ""
+        }
+        self.cancel_crawl = False
+        self.crawling_thread = None
+
+    def generate_unique_id(self, doc):
+        if hasattr(doc, 'id') and doc.id is not None:
+            return str(doc.id)
+        else:
+            base_str = f"{doc.author}_{doc.time}_{doc.author_id}"
+            if hasattr(doc, 'content') and doc.content:
+                base_str += f"_{doc.content}"
+            if hasattr(doc, 'title') and doc.title:
+                base_str += f"_{doc.title}"
+            return hashlib.sha256(base_str.encode('utf-8')).hexdigest()
+
+    async def safe_get_document(self, index, retries=10, delay=0.2):
+        for attempt in range(retries):
+            try:
+                doc = await index.document()
+                if doc is not None:
+                    return doc
+            except Exception as e:
+                logging.error(f"[게시글 재시도 {attempt+1}/{retries}] 오류: {e}")
+            await asyncio.sleep(delay * (2 ** attempt))
+        logging.error("[재시도 실패] 문서 가져오기 실패")
+        return None
+
+    async def safe_iterate_comments(self, comments_generator, retries=10, delay=0.2):
+        for attempt in range(retries):
+            try:
+                async for comm in comments_generator:
+                    yield comm
+                return
+            except Exception as e:
+                logging.error(f"[댓글 재시도 {attempt+1}/{retries}] 오류: {e}")
+                await asyncio.sleep(delay * (2 ** attempt))
+        logging.error("[재시도 실패] 댓글 가져오기 실패")
+
+    def get_doc_time_utc(self, doc_time):
+        if doc_time.tzinfo is None:
+            return doc_time.replace(tzinfo=timezone.utc)
+        else:
+            return doc_time.astimezone(timezone.utc)
+
+    async def check_start_page_valid(self, board_id, is_minor, start_page):
+        async with dc_api.API() as api:
+            if self.cancel_crawl:
+                raise ValueError("크롤링이 취소되었습니다.")
+            gen = api.board(board_id=board_id, is_minor=is_minor, start_page=start_page, num=1)
+            try:
+                first_item = await asyncio.wait_for(gen.__anext__(), timeout=5)
+            except StopAsyncIteration:
+                first_item = None
+            except asyncio.TimeoutError:
+                raise ValueError(f"입력한 크롤링 시작 페이지({start_page})가 갤러리 총 페이지 수 이상입니다.")
+
+    # api와 board_id를 추가로 받아, 댓글 크롤링 시 올바른 board_id를 사용합니다.
+    async def process_post(self, api, board_id, index, rank, data, processed_article_ids, target_start, target_end):
+        # 문서 가져오기 전 진행 상태 업데이트 (잠시 '불러오는 중'으로 표시)
+        self.progress_status["current_doc_title"] = "불러오는 중..."
+        doc = await self.safe_get_document(index)
+        if doc is None:
+            return "skip"
+        # 실제 게시글 제목 업데이트
+        doc_title = getattr(doc, 'title', None) or "(제목 없음)"
+        self.progress_status["current_doc_title"] = doc_title
+
+        article_uid = self.generate_unique_id(doc)
+        if article_uid in processed_article_ids:
+            logging.info(f"중복 집계 글 발견: {article_uid} 집계 제외")
+            return "skip"
+        processed_article_ids.add(article_uid)
+        try:
+            doc_time = self.get_doc_time_utc(doc.time)
+        except Exception as e:
+            logging.error(f"[시간 파싱 오류] {e}")
+            return "skip"
+        self.progress_status["current_doc_time"] = doc_time.strftime("%Y년 %m월 %d일 %H시")
+        if doc_time >= target_end:
+            return "skip"
+        if doc_time < target_start:
+            logging.info(f"[범위 외] {doc_time} < {target_start}")
+            return "old"
+        data['global_count'] = data.get('global_count', 0) + 1
+        self.progress_status["global_count"] = data['global_count']
+
+        # 50개마다 중간 저장
+        if data['global_count'] % 50 == 0:
+            elapsed_minutes = (datetime.now(timezone.utc) - data['start_time']).total_seconds() / 60.0
+            logging.info(f"[중간 저장] {doc.time} | 경과: {elapsed_minutes:.2f} 분")
+            data['rank'] = rank
+            save_json_data("data.json", data)
+
+        if data.get('start_date') is None or doc_time < data['start_date']:
+            data['start_date'] = doc_time
+        if data.get('end_date') is None or doc_time > data['end_date']:
+            data['end_date'] = doc_time
+        try:
+            writer = doc.author if doc.author_id is None else f"{doc.author}({doc.author_id})"
+            if writer in rank:
+                rank[writer]['article'] += 1
+            else:
+                rank[writer] = {"article": 1, "reply": 0}
+        except Exception as e:
+            logging.error(f"[게시글 집계 오류] {e}")
+        try:
+            processed_comment_ids = set()
+            # board_id를 매개변수로 받아올 수 있도록 수정
+            async for comm in self.safe_iterate_comments(api.comments(board_id=board_id, article_id=article_uid)):
+                try:
+                    unique_id = comm.id if hasattr(comm, 'id') and comm.id is not None else (comm.author, getattr(comm, 'content', None), getattr(comm, 'time', None))
+                    if unique_id in processed_comment_ids:
+                        continue
+                    processed_comment_ids.add(unique_id)
+                    writer = comm.author if comm.author_id is None else f"{comm.author}({comm.author_id})"
+                    if writer in rank:
+                        rank[writer]['reply'] += 1
+                    else:
+                        rank[writer] = {"article": 0, "reply": 1}
+                    logging.info(f"댓글 집계: 게시글 {article_uid}, 작성자: {writer}")
+                except Exception as e:
+                    logging.error(f"[댓글 집계 오류] {e}")
+            return "in_range"
+        except Exception as e:
+            logging.error(f"[댓글 처리 최종 오류] {e}")
+            await asyncio.sleep(0.01)
+            return "skip"
+
+    async def run_crawler(self, board_id, is_minor, start_page, target_start, target_end, old_threshold):
+        data = {
+            'start_date': None,
+            'end_date': None,
+            'date': datetime.now(timezone.utc),
+            'global_count': 0,
+            'start_time': datetime.now(timezone.utc)
+        }
+        self.progress_status["start_time"] = data['start_time']
+        self.progress_status["global_count"] = 0
+        self.progress_status["last_message"] = ""
+        logging.info("크롤링 시작...")
+        rank = {}
+        processed_article_ids = set()
+        consecutive_old_count = 0
+        async with dc_api.API() as api:
+            async for index in api.board(board_id=board_id, is_minor=is_minor, start_page=start_page):
+                if self.cancel_crawl:
+                    logging.info("크롤링 취소 요청됨.")
+                    break
+                status = await self.process_post(api, board_id, index, rank, data, processed_article_ids, target_start, target_end)
+                if status == "old":
+                    consecutive_old_count += 1
+                    if consecutive_old_count >= old_threshold:
+                        logging.info(f"연속 {old_threshold}개 범위 외 게시글 발견, 크롤링 중단")
+                        break
+                else:
+                    consecutive_old_count = 0
+        if data.get('start_date') is None:
+            logging.info("유효한 게시글 없음. fallback 기간 사용")
+            data['start_date'] = data['date'] - timedelta(days=1)
+            data['end_date'] = data['date']
+        data['rank'] = rank
+        save_json_data("data.json", data)
+        logging.info("크롤링 완료. data.json 생성됨.")
+        final_elapsed = (datetime.now(timezone.utc) - self.progress_status["start_time"]).total_seconds() / 60.0
+        self.progress_status["final_elapsed"] = final_elapsed
+
+    def start_crawling_thread(self, board_id, is_minor, start_page, target_start, target_end, old_threshold):
+        self.cancel_crawl = False
+        def run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(
+                self.run_crawler(board_id, is_minor, start_page, target_start, target_end, old_threshold)
+            )
+            loop.close()
+        t = threading.Thread(target=run)
+        t.daemon = True
+        t.start()
+        self.crawling_thread = t
+
+#############################################
+# DCCrawlerApp 클래스 (GUI)
+#############################################
+class DCCrawlerApp:
+    def __init__(self):
+        self.crawler = DCCrawler()
+        self.root = tk.Tk()
+        self.root.title("릿갤창랭킹 분석기")
+        self.original_width = 500
+        self.original_height = 450
+        center_window(self.root, self.original_width, self.original_height)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.log_panel_visible = False
+        self.log_frame = None
+        self.log_last_index = 0
+        self.main_container = tk.Frame(self.root)
+        self.main_container.pack(side="left", fill="both", expand=True)
+        self.board_choices = {
+            "릿갤": "illit",
+            "융갤": "yunah",
+            "밍갤": "minijju",
+            "뫀갤": "mokalatte",
+            "웒갤": "wonhee",
+            "롷갤": "illitiroha"
+        }
+        self.board_choice_var = tk.StringVar(self.root, value="릿갤")
+        self.is_minor_var = tk.BooleanVar(self.root, value=True)
+        self.start_page_var = tk.StringVar(self.root, value="1")
+        self.old_threshold_var = tk.StringVar(self.root, value="20")
+        # 날짜 범위 변수 추가
+        self.start_year_var = tk.StringVar(self.root, value="2025")
+        self.start_month_var = tk.StringVar(self.root, value="01")
+        self.start_day_var = tk.StringVar(self.root, value="01")
+        self.end_year_var = tk.StringVar(self.root, value="2025")
+        self.end_month_var = tk.StringVar(self.root, value="01")
+        self.end_day_var = tk.StringVar(self.root, value="31")
+        self.create_widgets()
+
+    def create_widgets(self):
+        top_frame = tk.Frame(self.main_container)
+        top_frame.pack(pady=10)
+        title_label = tk.Label(top_frame, text="릿창랭킹 분석기", font=("Arial", 16))
+        title_label.pack(side="left", padx=(10, 0))
+        
+        settings_frame = tk.LabelFrame(self.main_container, text="집계 설정")
+        settings_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        tk.Label(settings_frame, text="갤러리 선택:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        board_choice_cb = tk.OptionMenu(settings_frame, self.board_choice_var, *list(self.board_choices.keys()))
+        board_choice_cb.grid(row=0, column=1, padx=5, pady=5)
+        
+        tk.Label(settings_frame, text="크롤링 시작 페이지:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        start_page_entry = tk.Entry(settings_frame, textvariable=self.start_page_var)
+        start_page_entry.grid(row=2, column=1, padx=5, pady=5)
+        
+        date_frame = tk.LabelFrame(settings_frame, text="집계 날짜 범위")
+        date_frame.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=5)
+        years = [str(y) for y in range(2020, 2031)]
+        months = [f"{m:02d}" for m in range(1, 13)]
+        days = [f"{d:02d}" for d in range(1, 32)]
+        tk.Label(date_frame, text="시작 날짜:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        start_year_cb = tk.OptionMenu(date_frame, self.start_year_var, *years)
+        start_year_cb.grid(row=0, column=1, padx=2, pady=2)
+        start_month_cb = tk.OptionMenu(date_frame, self.start_month_var, *months)
+        start_month_cb.grid(row=0, column=2, padx=2, pady=2)
+        start_day_cb = tk.OptionMenu(date_frame, self.start_day_var, *days)
+        start_day_cb.grid(row=0, column=3, padx=2, pady=2)
+        tk.Label(date_frame, text="종료 날짜:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        end_year_cb = tk.OptionMenu(date_frame, self.end_year_var, *years)
+        end_year_cb.grid(row=1, column=1, padx=2, pady=2)
+        end_month_cb = tk.OptionMenu(date_frame, self.end_month_var, *months)
+        end_month_cb.grid(row=1, column=2, padx=2, pady=2)
+        end_day_cb = tk.OptionMenu(date_frame, self.end_day_var, *days)
+        end_day_cb.grid(row=1, column=3, padx=2, pady=2)
+        
+        tk.Label(settings_frame, text="보고서 출력 포맷:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        output_frame = tk.Frame(settings_frame)
+        output_frame.grid(row=4, column=1, padx=5, pady=5, sticky="w")
+        tk.Radiobutton(output_frame, text="TXT", variable=self.old_threshold_var, value="TXT").pack(side="left", padx=5)
+        tk.Radiobutton(output_frame, text="HTML", variable=self.old_threshold_var, value="HTML").pack(side="left", padx=5)
+        help_button_settings = tk.Button(settings_frame, text="도움말", command=self.show_help_window)
+        help_button_settings.grid(row=3, column=2, padx=(50,5), pady=5, sticky="e")
+        
+        button_frame = tk.Frame(self.main_container)
+        button_frame.pack(pady=10)
+        self.crawl_button = tk.Button(button_frame, text="집계 시작", command=self.start_crawl)
+        self.crawl_button.grid(row=0, column=0, padx=10, pady=5)
+        self.cancel_button = tk.Button(button_frame, text="취소", command=self.cancel_crawl, state="normal")
+        self.cancel_button.grid(row=0, column=1, padx=10, pady=5)
+        report_button = tk.Button(button_frame, text="보고서 생성 및 확인", command=self.generate_and_open_report)
+        report_button.grid(row=0, column=2, padx=10, pady=5)
+        log_button = tk.Button(button_frame, text="로그 보기", command=self.toggle_log_panel)
+        log_button.grid(row=0, column=3, padx=10, pady=5)
+        
+        status_frame = tk.LabelFrame(self.main_container, text="진행 상황")
+        status_frame.pack(fill="x", padx=10, pady=10)
+        self.current_time_label = tk.Label(status_frame, text="게시글 시간: N/A", font=("Arial", 12), wraplength=480)
+        self.current_time_label.pack(pady=5)
+        self.elapsed_label = tk.Label(status_frame, text="집계 경과: N/A", font=("Arial", 12), wraplength=480)
+        self.elapsed_label.pack(pady=5)
+        self.current_title_label = tk.Label(status_frame, text="현재 긁는 글: N/A", font=("Arial", 12), wraplength=480)
+        self.current_title_label.pack(pady=5)
+        self.update_status_label()
+
+    def show_help_window(self):
+        help_win = tk.Toplevel(self.root)
+        help_win.title("도움말")
+        center_window(help_win, 450, 400)
+        help_text = (
+           "각 항목에 대한 입력 방법:\n\n"
+            "1. 갤러리 선택:\n"
+            "   - 분석할 갤러리를 선택합니다. (표시명: 릿갤, 융갤, 밍갤 등)\n\n"
+            "2. 크롤링 시작 페이지:\n"
+            "   - 집계를 시작할 페이지를 설정합니다.\n"
+            "   - 해당 페이지의 게시글 날짜는 집계 시작 날짜보다 앞서야 합니다.\n"
+            "   - 페이지의 날짜와 집계 시작 날짜가 가깝게 설정되는 것이 좋습니다.\n\n"
+            "3. 집계 날짜 범위:\n"
+            "   - [시작 날짜]: 입력한 날짜의 *다음 날* 00:00부터 집계됩니다.\n"
+            "     (예: 2025-01-31로 입력하면, 2025-02-01 00:00부터 집계 시작)\n"
+            "   - [종료 날짜]: 입력한 날짜의 00:00까지 집계됩니다.\n"
+            "     (예: 2025-01-01로 입력하면, 2025-01-01 00:00까지 집계)\n\n"
+            "4. 출력 포맷:\n"
+            "   - 보고서를 TXT 또는 HTML 형식으로 생성할지 선택합니다.\n"
+            "   - txt는 그대로 복붙, html은 컴디시에서 html박스 클릭 후 복붙해서 글 등록\n")
+        help_label = tk.Label(help_win, text=help_text, justify="left", anchor="nw", wraplength=430)
+        help_label.pack(padx=10, pady=10, fill="both", expand=True)
+        close_button = tk.Button(help_win, text="확인", command=help_win.destroy)
+        close_button.pack(pady=5)
+
+    def update_status_label(self):
+        error_msg = self.crawler.progress_status.get("error")
+        if error_msg:
+            tk.messagebox.showerror("크롤링 오류", error_msg)
+            self.crawler.progress_status["error"] = None
+            self.crawl_button.config(state="normal")
+        current_title = self.crawler.progress_status.get("current_doc_title", "N/A")
+        current_time = self.crawler.progress_status.get("current_doc_time", "N/A")
+        count = self.crawler.progress_status.get("global_count", 0)
+        self.current_time_label.config(text=f"현재 {current_time} 글 크롤링 중 (총 {count}개 처리)")
+        self.current_title_label.config(text=f"현재 긁는 글: {current_title}")
+        if self.crawler.crawling_thread is not None and self.crawler.crawling_thread.is_alive():
+            elapsed_minutes = (datetime.now(timezone.utc) - self.crawler.progress_status["start_time"]).total_seconds() / 60.0
+            self.elapsed_label.config(text=f"집계 {elapsed_minutes:.2f}분 경과")
+        else:
+            final_elapsed = self.crawler.progress_status.get("final_elapsed")
+            if final_elapsed is not None:
+                self.elapsed_label.config(text=f"집계 {final_elapsed:.2f}분 경과 (완료)")
+            else:
+                self.elapsed_label.config(text="집계 경과: N/A")
+            self.crawl_button.config(state="normal")
+        self.root.after(500, self.update_status_label)
+
+    def start_crawl(self):
+        if self.crawler.crawling_thread is not None and self.crawler.crawling_thread.is_alive():
+            tk.messagebox.showwarning("경고", "이미 집계 작업이 진행 중입니다.")
+            return
+        try:
+            board_choice = self.board_choice_var.get().strip()
+            board_id = self.board_choices[board_choice]
+            is_minor = self.is_minor_var.get()
+            start_page = int(self.start_page_var.get().strip())
+            old_threshold = int(self.old_threshold_var.get().strip())
+            old_date_str = f"{self.start_year_var.get()}-{self.start_month_var.get()}-{self.start_day_var.get()}"
+            target_start = datetime.strptime(old_date_str, "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+            new_date_str = f"{self.end_year_var.get()}-{self.end_month_var.get()}-{self.end_day_var.get()}"
+            target_end = (datetime.strptime(new_date_str, "%Y-%m-%d") + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+        except Exception as e:
+            tk.messagebox.showerror("입력 오류", f"입력한 값이 올바르지 않습니다: {e}")
+            return
+        self.crawler.progress_status["board_display"] = board_choice
+        self.crawler.progress_status["global_count"] = 0
+        self.crawler.progress_status["last_message"] = ""
+        self.crawl_button.config(state="disabled")
+        self.crawler.progress_status["start_time"] = datetime.now(timezone.utc)
+        self.crawler.start_crawling_thread(board_id, is_minor, start_page, target_start, target_end, old_threshold)
+
+    def cancel_crawl(self):
+        if self.crawler.crawling_thread is not None and self.crawler.crawling_thread.is_alive():
+            if tk.messagebox.askyesno("취소 확인", "정말로 집계를 취소하시겠습니까?"):
+                self.crawler.cancel_crawl = True
+                tk.messagebox.showinfo("취소 요청", "취소 요청이 전송되었습니다.")
+                self.crawl_button.config(state="normal")
+        else:
+            tk.messagebox.showwarning("취소", "진행 중인 작업이 없습니다.")
+
+    def generate_and_open_report(self):
+        report_file = generate_report(self.old_threshold_var.get())
+        if report_file and os.path.exists(report_file):
+            tk.messagebox.showinfo("보고서 생성 완료", f"보고서가 생성되었습니다: {report_file}")
+            try:
+                os.startfile(report_file)
+            except Exception as e:
+                import webbrowser
+                webbrowser.open_new_tab(report_file)
+        else:
+            tk.messagebox.showerror("보고서 생성 실패", "보고서 생성에 실패하였습니다. data.json 파일을 확인하세요.")
+
+    def toggle_log_panel(self):
+        extra_width = 400
+        if self.log_panel_visible:
+            if self.log_frame is not None:
+                self.log_frame.pack_forget()
+            self.log_panel_visible = False
+            new_width = self.original_width
+            self.root.geometry(f"{new_width}x{self.original_height}")
+        else:
+            if self.log_frame is None:
+                self.log_frame = tk.Frame(self.root, width=extra_width)
+                self.log_text = tk.Text(self.log_frame, wrap="none", state="normal")
+                self.log_text.pack(side="left", fill="both", expand=True)
+                scrollbar = tk.Scrollbar(self.log_frame, command=self.log_text.yview)
+                scrollbar.pack(side="right", fill="y")
+                self.log_text.config(yscrollcommand=scrollbar.set)
+                self.log_last_index = 0
+            self.log_frame.pack(side="right", fill="y")
+            self.log_panel_visible = True
+            new_width = self.original_width + extra_width
+            self.root.geometry(f"{new_width}x{self.original_height}")
+            self.update_log_text()
+
+    def update_log_text(self):
+        if not self.log_panel_visible:
+            return
+        with LOG_BUFFER_LOCK:
+            new_messages = LOG_BUFFER[self.log_last_index:]
+            if new_messages:
+                for msg in new_messages:
+                    self.log_text.insert(tk.END, msg + "\n")
+                self.log_text.see(tk.END)
+                self.log_last_index = len(LOG_BUFFER)
+        self.root.after(500, self.update_log_text)
+
+    def on_closing(self):
+        if tk.messagebox.askokcancel("종료 확인", "정말로 종료하시겠습니까?"):
+            self.cancel_crawl()
+            self.root.destroy()
+            sys.exit()
+
+    def run(self):
+        self.root.mainloop()
+
+#############################################
+# 보고서 생성 및 집계 관련 함수들
+#############################################
+def generate_report(output_format="HTML"):
+    try:
+        data = load_json_data("data.json")
+    except Exception as e:
+        logging.error("data.json 파일을 불러올 수 없습니다. " + str(e))
+        return None
+    rank_data = data.get("rank", {})
+    if not rank_data:
+        logging.error("data.json 파일에 'rank' 데이터가 없습니다.")
+        return None
+    idrank = aggregate_user_data(rank_data)
+    start_dt, end_dt = determine_date_range(data, rank_data)
+    if start_dt is None or end_dt is None:
+        fallback = datetime.now()
+        if start_dt is None:
+            start_dt = fallback - timedelta(days=1)
+        if end_dt is None:
+            end_dt = fallback
+    startdate_str = start_dt.strftime('%Y/%m/%d %H:%M:%S')
+    enddate_str = end_dt.strftime('%Y/%m/%d %H:%M:%S')
+    calculate_scores_and_ranks(idrank)
+    top_users, total_top_score = extract_top_users(idrank, top_limit=100)
+    if output_format.upper() == "TXT":
+        report_content = generate_text_report(startdate_str, enddate_str, idrank, top_users, total_top_score)
+    else:
+        report_content = generate_html_report(startdate_str, enddate_str, idrank, top_users, total_top_score)
+    report_filename = "report.txt"
+    with open(report_filename, "w", encoding="utf-8") as fw:
+        fw.write(report_content)
+    return report_filename
+
+def aggregate_user_data(rank: dict) -> dict:
+    idrank = {}
+    for key in rank:
+        parts = key.split('(')
+        if len(parts) <= 1:
+            continue
+        nick = parts[0]
+        user_id = parts[1][:-1]
+        if user_id not in idrank:
+            idrank[user_id] = {"nicks": set(), "article": 0, "reply": 0}
+        idrank[user_id]["article"] += int(rank[key]["article"])
+        idrank[user_id]["reply"] += int(rank[key]["reply"])
+        if nick != "ㅤ" and not nick.endswith('..'):
+            idrank[user_id]["nicks"].add(nick)
+    return idrank
+
+def determine_date_range(data: dict, rank: dict) -> (datetime, datetime):
+    start_date = data.get("start_date")
+    end_date = data.get("end_date")
+    if start_date is not None and end_date is not None:
+        return start_date, end_date
+    dates = []
+    for entry in rank.values():
+        if "date" in entry and entry["date"] is not None:
+            dates.append(entry["date"])
+    if dates:
+        return min(dates), max(dates)
+    fallback = data.get("date", datetime.now())
+    return fallback - timedelta(days=1), fallback
+
+def calculate_scores_and_ranks(idrank: dict) -> None:
+    for user_id in idrank:
+        idrank[user_id]["score"] = idrank[user_id]["article"] * 3 + idrank[user_id]["reply"]
+    sorted_by_article = sorted(idrank.items(), key=lambda x: x[1]["article"], reverse=True)
+    rank_num = 1
+    for i, (user_id, data) in enumerate(sorted_by_article):
+        if i != 0 and sorted_by_article[i - 1][1]["article"] != data["article"]:
+            rank_num += 1
+        idrank[user_id]["articleRank"] = rank_num
+    sorted_by_reply = sorted(idrank.items(), key=lambda x: x[1]["reply"], reverse=True)
+    rank_num = 1
+    for i, (user_id, data) in enumerate(sorted_by_reply):
+        if i != 0 and sorted_by_reply[i - 1][1]["reply"] != data["reply"]:
+            rank_num += 1
+        idrank[user_id]["replyRank"] = rank_num
+
+def extract_top_users(idrank: dict, top_limit: int = 100) -> (list, float):
+    sorted_by_score = sorted(idrank.items(), key=lambda x: x[1]["score"], reverse=True)
+    top_users = []
+    rank_num_final = 1
+    for i, (user_id, user_data) in enumerate(sorted_by_score):
+        if i != 0 and sorted_by_score[i - 1][1]["score"] != user_data["score"]:
+            rank_num_final += 1
+        if rank_num_final > top_limit:
+            break
+        top_users.append((rank_num_final, user_id, user_data))
+    total_top_score = sum(user_data["score"] for (_, _, user_data) in top_users)
+    return top_users, total_top_score
+
+def generate_html_report(startdate: str, enddate: str, idrank: dict, top_users: list, total_top_score: float) -> str:
+    total_articles = sum(user_data["article"] for user_data in idrank.values())
+    total_replies = sum(user_data["reply"] for user_data in idrank.values())
+    html_lines = [
+        "<html>",
+        "<head>",
+        '    <meta charset="UTF-8">',
+        "    <title>집계 결과</title>",
+        "</head>",
+        '<body style="font-size:12px; font-family: sans-serif;">',
+        f"    <p>집계 기간 : {startdate} ~ {enddate}</p>",
+        "    <p>(글+3점, 댓글+1점)</p>",
+        f"    <p>총 글 수: {total_articles}개, 총 댓글 수: {total_replies}개</p>"
+    ]
+    for rank_val, user_id, user_data in top_users:
+        nicks = [nick for nick in user_data["nicks"] if nick != "ㅤ"]
+        share = (user_data["score"] / total_top_score * 100) if total_top_score else 0
+        html_lines.append(
+            f"    <p>{rank_val}등 : {','.join(nicks)}({user_id}) | 총 점: {user_data['score']}점 | "
+            f"갤 지분(총점): {share:.2f}% | 글 {user_data['article']}개({user_data['articleRank']}위), "
+            f"댓글 {user_data['reply']}개({user_data['replyRank']}위)</p>"
+        )
+        html_lines.append("    <hr>")
+    html_lines.extend(["</body>", "</html>"])
+    return "\n".join(html_lines)
+
+def generate_text_report(startdate: str, enddate: str, idrank: dict, top_users: list, total_top_score: float) -> str:
+    lines = [
+        f"집계 기간 : {startdate} ~ {enddate}",
+        "(글+3점, 댓글+1점)"
+    ]
+    total_articles = sum(user_data["article"] for user_data in idrank.values())
+    total_replies = sum(user_data["reply"] for user_data in idrank.values())
+    lines.append(f"총 글 수: {total_articles}개, 총 댓글 수: {total_replies}개")
+    lines.append("-" * 40)
+    for rank_val, user_id, user_data in top_users:
+        nicks = [nick for nick in user_data["nicks"] if nick != "ㅤ"]
+        share = (user_data["score"] / total_top_score * 100) if total_top_score else 0
+        lines.append(
+            f"{rank_val}등 : {','.join(nicks)}({user_id}) | 총 점: {user_data['score']}점 | "
+            f"갤 지분(총점): {share:.2f}% | 글 {user_data['article']}개({user_data['articleRank']}위), "
+            f"댓글 {user_data['reply']}개({user_data['replyRank']}위)"
+        )
+        lines.append("-" * 40)
+    return "\n".join(lines)
+
+if __name__ == '__main__':
+    temp_root = tk.Tk()
+    temp_root.withdraw()
+    answer = tk.messagebox.askyesno("응원 확인", "아일릿을 응원하십니까?")
+    if not answer:
+        tk.messagebox.showinfo("프로그램 종료", "이 프로그램을 사용할 자격이 없습니다.")
+        sys.exit(0)
+    temp_root.destroy()
+    
+    app = DCCrawlerApp()
+    app.root.update_idletasks()
+    center_window(app.root, app.original_width, app.original_height)
+    app.root.attributes('-topmost', True)
+    app.root.after(1000, lambda: app.root.attributes('-topmost', False))
+    app.run()
