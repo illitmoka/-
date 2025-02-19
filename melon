@@ -1,344 +1,169 @@
-import sys
-import time
-import random
-import json
-import numpy as np
-import cv2
-import pyautogui
-from pynput import mouse
+import sys import time import random import json import numpy as np import cv2 import pyautogui from pynput import mouse
 
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit
-)
-from PyQt5.QtCore import (
-    QThread, pyqtSignal, QMutex, QWaitCondition,
-    QTimer
-)
+from PyQt5.QtWidgets import ( QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit ) from PyQt5.QtCore import ( QThread, pyqtSignal, QMutex, QWaitCondition, QTimer )
 
 #########################################
-# 초기 클릭 좌표 기록 스레드
-#########################################
-class InitialClickRecorderThread(QThread):
-    recorded_signal = pyqtSignal(list)  # 기록된 17개 좌표 리스트 전달
-    message_signal = pyqtSignal(str)
-    
-    def run(self):
-        self.message_signal.emit("초기 17회 클릭: 화면에서 원하는 좌표를 클릭하세요.")
-        self.clicks = []
-        def on_click(x, y, button, pressed):
-            if pressed:
-                self.clicks.append((x, y))
-                self.message_signal.emit(f"클릭 기록: {(x, y)} ({len(self.clicks)}/17)")
-                if len(self.clicks) >= 17:
-                    return False  # 17회 클릭 후 리스너 종료
-        with mouse.Listener(on_click=on_click) as listener:
-            listener.join()
-        self.recorded_signal.emit(self.clicks)
+
+초기 클릭 좌표 기록 스레드
+
+######################################### class InitialClickRecorderThread(QThread): recorded_signal = pyqtSignal(list) message_signal = pyqtSignal(str)
+
+def run(self):
+    self.message_signal.emit("초기 17회 클릭: 화면에서 원하는 좌표를 클릭하세요.")
+    self.clicks = []
+    def on_click(x, y, button, pressed):
+        if pressed:
+            self.clicks.append((x, y))
+            self.message_signal.emit(f"클릭 기록: {(x, y)} ({len(self.clicks)}/17)")
+            if len(self.clicks) >= 17:
+                return False
+    with mouse.Listener(on_click=on_click) as listener:
+        listener.join()
+    self.recorded_signal.emit(self.clicks)
 
 #########################################
-# 랜덤 클릭 스레드 (기록된 17개 좌표를 기반으로 부드러운 이동 후 클릭)
-#########################################
-class RandomClickThread(QThread):
-    log_signal = pyqtSignal(str)
-    
-    def __init__(self, coordinates, parent=None):
-        super().__init__(parent)
-        self.coordinates = coordinates  # 초기 클릭으로 기록된 좌표 목록
-        self._running = True
-        self.paused = False
-        self.mutex = QMutex()
-        self.pause_condition = QWaitCondition()
 
-    def run(self):
-        while self._running:
-            self.mutex.lock()
-            if self.paused:
-                self.pause_condition.wait(self.mutex)
-            self.mutex.unlock()
-            try:
-                coord = random.choice(self.coordinates)
-                pyautogui.moveTo(coord[0], coord[1], duration=0.2)
-                pyautogui.click()
-                self.log_signal.emit(f"랜덤 클릭: {coord}")
-            except Exception as e:
-                self.log_signal.emit("랜덤 클릭 오류: " + str(e))
-            time.sleep(0.5)
+랜덤 클릭 스레드 (클릭 후 즉시 색상 감지)
 
-    def pause(self):
+######################################### class RandomClickThread(QThread): log_signal = pyqtSignal(str) trigger_detection = pyqtSignal()
+
+def __init__(self, coordinates, parent=None):
+    super().__init__(parent)
+    self.coordinates = coordinates
+    self._running = True
+    self.paused = False
+    self.mutex = QMutex()
+    self.pause_condition = QWaitCondition()
+
+def run(self):
+    while self._running:
         self.mutex.lock()
-        self.paused = True
+        if self.paused:
+            self.pause_condition.wait(self.mutex)
         self.mutex.unlock()
-
-    def resume(self):
-        self.mutex.lock()
-        self.paused = False
-        self.pause_condition.wakeAll()
-        self.mutex.unlock()
-
-    def stop(self):
-        self._running = False
-        self.resume()
-
-#########################################
-# 색상 감지 스레드 (지정된 영역 내 타겟 색상 감지)
-#########################################
-class ColorDetectionThread(QThread):
-    detected_signal = pyqtSignal(tuple)  # 감지된 좌표 (x, y) 전달
-
-    def __init__(self, target_color, tolerance=30, region=(0, 0, 100, 100), parent=None):
-        super().__init__(parent)
-        self.target_color = target_color
-        self.tolerance = tolerance
-        self.region = region
-        self._running = True
-
-    def run(self):
-        while self._running:
-            try:
-                screenshot = pyautogui.screenshot(region=self.region)
-                img = np.array(screenshot)
-                lower_bound = np.array([
-                    max(0, self.target_color[0] - self.tolerance),
-                    max(0, self.target_color[1] - self.tolerance),
-                    max(0, self.target_color[2] - self.tolerance)
-                ])
-                upper_bound = np.array([
-                    min(255, self.target_color[0] + self.tolerance),
-                    min(255, self.target_color[1] + self.tolerance),
-                    min(255, self.target_color[2] + self.tolerance)
-                ])
-                mask = cv2.inRange(img, lower_bound, upper_bound)
-                coords = np.column_stack(np.where(mask > 0))
-                if coords.size != 0:
-                    y, x = coords[0]
-                    detected_coord = (self.region[0] + x, self.region[1] + y)
-                    self.detected_signal.emit(detected_coord)
-                    break  # 감지 후 스레드 종료
-            except Exception as e:
-                print("색상 감지 오류:", e)
-            time.sleep(0.5)
-
-    def stop(self):
-        self._running = False
-
-#########################################
-# 색상 감지 (마우스 클릭) 스레드
-#########################################
-class ColorPickerThread(QThread):
-    color_picked = pyqtSignal(tuple)  # (R, G, B) 튜플 전달
-    message_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-
-    def run(self):
-        self.message_signal.emit("화면에서 원하는 위치를 클릭하세요.")
-        def on_click(x, y, button, pressed):
-            if pressed:
-                screenshot = pyautogui.screenshot(region=(x, y, 1, 1))
-                img = np.array(screenshot)
-                color = tuple(int(c) for c in img[0, 0])
-                self.color_picked.emit(color)
-                return False  # 클릭 후 리스너 종료
-        with mouse.Listener(on_click=on_click) as listener:
-            listener.join()
-        self.finished_signal.emit()
-
-#########################################
-# 전역 마우스 우클릭 감지 스레드 (우클릭 시 프로그램 종료)
-#########################################
-class GlobalRightClickThread(QThread):
-    right_click_signal = pyqtSignal()
-
-    def run(self):
-        def on_click(x, y, button, pressed):
-            if pressed and button == mouse.Button.right:
-                self.right_click_signal.emit()
-                return False  # 우클릭 후 리스너 종료
-        with mouse.Listener(on_click=on_click) as listener:
-            listener.join()
-
-#########################################
-# 메인 윈도우 (GUI 및 로직 통합)
-#########################################
-class MainWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("감시 프로그램")
-        self.resize(450, 450)
-
-        # 설정 파일(config.json)에서 감시 영역을 로드 (없으면 기본값 사용)
         try:
-            with open("config.json", "r") as f:
-                config = json.load(f)
-        except Exception as e:
-            config = {}
-        self.monitoring_region = tuple(config.get("monitoring_region", [32, 190, 600, 440]))
-
-        # UI 구성
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        self.layout = QVBoxLayout(central_widget)
-
-        self.label_status = QLabel("상태: 대기 중")
-        self.layout.addWidget(self.label_status)
-
-        self.line_edit_color = QLineEdit()
-        self.line_edit_color.setPlaceholderText("색상 코드 (예: #FF0000)")
-        self.layout.addWidget(self.line_edit_color)
-
-        self.button_start = QPushButton("감시시작")
-        self.layout.addWidget(self.button_start)
-        self.button_start.clicked.connect(self.start_monitoring)
-
-        self.button_pick_color = QPushButton("색상 감지 (마우스 클릭)")
-        self.layout.addWidget(self.button_pick_color)
-        self.button_pick_color.clicked.connect(self.start_color_picker)
-
-        self.label_shortcut = QLabel("※ (키보드 단축키 일시정지/재개 기능은 제거되었습니다.)")
-        self.layout.addWidget(self.label_shortcut)
-
-        self.text_log = QTextEdit()
-        self.text_log.setReadOnly(True)
-        self.layout.addWidget(self.text_log)
-
-        # 스레드 및 좌표 변수들
-        self.random_thread = None
-        self.color_detection_thread = None
-        self.target_color = None
-        self.color_picker_thread = None
-        self.initial_click_coords = []
-        self.initial_click_thread = None
-
-        # 전역 우클릭 감지 스레드 시작 (우클릭 시 프로그램 종료)
-        self.global_right_click_thread = GlobalRightClickThread()
-        self.global_right_click_thread.right_click_signal.connect(self.on_global_right_click)
-        self.global_right_click_thread.start()
-
-    def log_message(self, msg):
-        self.text_log.append(msg)
-        print(msg)
-
-    def parse_color_code(self, code):
-        code = code.strip()
-        if code.startswith("#"):
-            code = code[1:]
-        if len(code) != 6:
-            return None
-        try:
-            r = int(code[0:2], 16)
-            g = int(code[2:4], 16)
-            b = int(code[4:6], 16)
-            return (r, g, b)
-        except Exception:
-            return None
-
-    def start_monitoring(self):
-        color_code = self.line_edit_color.text()
-        target_color = self.parse_color_code(color_code)
-        if target_color is None:
-            self.log_message("잘못된 색상 코드입니다!")
-            return
-        self.target_color = target_color
-        self.log_message(f"감시 영역: {self.monitoring_region} / 감시 시작!")
-        # 초기 17회 클릭 좌표를 기록하도록 사용자에게 유도
-        self.initial_click_coords = []
-        self.initial_click_thread = InitialClickRecorderThread()
-        self.initial_click_thread.message_signal.connect(self.log_message)
-        self.initial_click_thread.recorded_signal.connect(self.on_initial_clicks_recorded)
-        self.initial_click_thread.start()
-
-    def on_initial_clicks_recorded(self, coords):
-        self.initial_click_coords = coords
-        self.log_message("초기 17회 클릭 완료. 기록된 좌표: " + str(coords))
-        self.start_random_click_thread()
-        self.start_color_detection_thread()
-
-    def start_random_click_thread(self):
-        if not self.initial_click_coords:
-            self.log_message("초기 좌표 기록 실패, 랜덤 클릭 중단.")
-            return
-        self.random_thread = RandomClickThread(self.initial_click_coords)
-        self.random_thread.log_signal.connect(self.log_message)
-        self.random_thread.start()
-
-    def start_color_detection_thread(self):
-        if self.monitoring_region is None or self.target_color is None:
-            return
-        self.color_detection_thread = ColorDetectionThread(
-            target_color=self.target_color,
-            tolerance=30,
-            region=self.monitoring_region
-        )
-        self.color_detection_thread.detected_signal.connect(self.on_color_detected)
-        self.color_detection_thread.start()
-
-    def on_color_detected(self, detected_coord):
-        self.log_message(f"색상 감지됨 at {detected_coord}. 클릭 진행 중...")
-        if self.random_thread:
-            self.random_thread.pause()
-        self.perform_detection_click(detected_coord)
-
-    def perform_detection_click(self, detected_coord):
-        # 감지된 좌표에서 (5, 5) 오프셋을 추가하여 클릭
-        adjusted_coord = (detected_coord[0] + 5, detected_coord[1] + 5)
-        QTimer.singleShot(0, lambda: self.safe_click(adjusted_coord, 0.2, "감지 좌표(오프셋 적용) 클릭 완료"))
-        QTimer.singleShot(300, lambda: self.safe_click((850, 676), 0.2, "(850,676) 클릭 완료"))
-        QTimer.singleShot(3000, self.resume_random_click)
-
-    def safe_click(self, coord, duration, message):
-        try:
-            pyautogui.moveTo(coord[0], coord[1], duration=duration)
+            coord = random.choice(self.coordinates)
+            pyautogui.moveTo(coord[0], coord[1], duration=0.2)
             pyautogui.click()
-            self.log_message(message)
+            self.log_signal.emit(f"랜덤 클릭: {coord}")
+            self.trigger_detection.emit()
         except Exception as e:
-            self.log_message("클릭 중 오류: " + str(e))
+            self.log_signal.emit("랜덤 클릭 오류: " + str(e))
+        time.sleep(0.2)
 
-    def resume_random_click(self):
-        if self.random_thread:
-            self.random_thread.resume()
-        self.log_message("랜덤 클릭 재개됨.")
-        self.start_color_detection_thread()
+def pause(self):
+    self.mutex.lock()
+    self.paused = True
+    self.mutex.unlock()
 
-    def start_color_picker(self):
-        self.log_message("마우스 클릭으로 색상 감지 대기 중...")
-        self.button_pick_color.setEnabled(False)
-        self.color_picker_thread = ColorPickerThread()
-        self.color_picker_thread.message_signal.connect(self.log_message)
-        self.color_picker_thread.color_picked.connect(self.on_color_picked)
-        self.color_picker_thread.finished_signal.connect(self.color_picker_finished)
-        self.color_picker_thread.start()
+def resume(self):
+    self.mutex.lock()
+    self.paused = False
+    self.pause_condition.wakeAll()
+    self.mutex.unlock()
 
-    def on_color_picked(self, color):
-        hex_color = '#{:02X}{:02X}{:02X}'.format(*color)
-        self.log_message(f"클릭한 위치 색상: {color} ({hex_color})")
-        self.line_edit_color.setText(hex_color)
+def stop(self):
+    self._running = False
+    self.resume()
 
-    def color_picker_finished(self):
-        self.button_pick_color.setEnabled(True)
+#########################################
 
-    def on_global_right_click(self):
-        self.log_message("마우스 우클릭이 감지되었습니다. 프로그램을 종료합니다.")
-        self.close()
-        # 모든 스레드가 중지되고 프로세스가 완전히 종료되도록 함
-        sys.exit(0)
+색상 감지 스레드
 
-    def closeEvent(self, event):
-        if self.random_thread and self.random_thread.isRunning():
-            self.random_thread.stop()
-            self.random_thread.wait()
-        if self.color_detection_thread and self.color_detection_thread.isRunning():
-            self.color_detection_thread.stop()
-            self.color_detection_thread.wait()
-        if self.color_picker_thread and self.color_picker_thread.isRunning():
-            self.color_picker_thread.terminate()
-            self.color_picker_thread.wait()
-        if self.global_right_click_thread and self.global_right_click_thread.isRunning():
-            self.global_right_click_thread.terminate()
-            self.global_right_click_thread.wait()
-        event.accept()
+######################################### class ColorDetectionThread(QThread): detected_signal = pyqtSignal(tuple)
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+def __init__(self, target_color, tolerance=30, region=(0, 0, 100, 100), parent=None):
+    super().__init__(parent)
+    self.target_color = target_color
+    self.tolerance = tolerance
+    self.region = region
+    self._running = True
+
+def run(self):
+    while self._running:
+        try:
+            screenshot = pyautogui.screenshot(region=self.region)
+            img = np.array(screenshot)
+            lower_bound = np.array([max(0, c - self.tolerance) for c in self.target_color])
+            upper_bound = np.array([min(255, c + self.tolerance) for c in self.target_color])
+            mask = cv2.inRange(img, lower_bound, upper_bound)
+            coords = np.column_stack(np.where(mask > 0))
+            if coords.size != 0:
+                y, x = coords[0]
+                detected_coord = (self.region[0] + x, self.region[1] + y)
+                self.detected_signal.emit(detected_coord)
+                break
+        except Exception as e:
+            print("색상 감지 오류:", e)
+        time.sleep(0.2)
+
+def stop(self):
+    self._running = False
+
+#########################################
+
+메인 윈도우
+
+######################################### class MainWindow(QMainWindow): def init(self): super().init() self.setWindowTitle("감시 프로그램") self.resize(450, 450)
+
+self.monitoring_region = (32, 190, 600, 440)
+    self.target_color = None
+    self.initial_click_coords = []
+    self.random_thread = None
+    self.color_detection_thread = None
+    
+    central_widget = QWidget()
+    self.setCentralWidget(central_widget)
+    layout = QVBoxLayout(central_widget)
+    
+    self.label_status = QLabel("상태: 대기 중")
+    layout.addWidget(self.label_status)
+    
+    self.text_log = QTextEdit()
+    self.text_log.setReadOnly(True)
+    layout.addWidget(self.text_log)
+
+def log_message(self, msg):
+    self.text_log.append(msg)
+    print(msg)
+
+def start_random_click_thread(self):
+    if not self.initial_click_coords:
+        self.log_message("초기 좌표 기록 실패, 랜덤 클릭 중단.")
+        return
+    self.random_thread = RandomClickThread(self.initial_click_coords)
+    self.random_thread.log_signal.connect(self.log_message)
+    self.random_thread.trigger_detection.connect(self.start_color_detection_thread)
+    self.random_thread.start()
+
+def start_color_detection_thread(self):
+    if self.monitoring_region is None or self.target_color is None:
+        return
+    self.color_detection_thread = ColorDetectionThread(
+        target_color=self.target_color,
+        tolerance=30,
+        region=self.monitoring_region
+    )
+    self.color_detection_thread.detected_signal.connect(self.on_color_detected)
+    self.color_detection_thread.start()
+
+def on_color_detected(self, detected_coord):
+    self.log_message(f"색상 감지됨 at {detected_coord}. 클릭 진행 중...")
+    if self.random_thread:
+        self.random_thread.pause()
+    self.perform_detection_click(detected_coord)
+
+def perform_detection_click(self, detected_coord):
+    adjusted_coord = (detected_coord[0] + 5, detected_coord[1] + 5)
+    pyautogui.moveTo(adjusted_coord[0], adjusted_coord[1], duration=0.2)
+    pyautogui.click()
+    self.log_message("감지 좌표(오프셋 적용) 클릭 완료")
+    QTimer.singleShot(3000, self.resume_random_click)
+
+def resume_random_click(self):
+    if self.random_thread:
+        self.random_thread.resume()
+    self.log_message("랜덤 클릭 재개됨.")
+
+if name == "main": app = QApplication(sys.argv) window = MainWindow() window.show() sys.exit(app.exec_())
+
