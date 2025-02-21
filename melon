@@ -2,6 +2,7 @@ import sys
 import time
 import random
 import json
+import math
 import numpy as np
 import cv2
 import pyautogui
@@ -16,29 +17,15 @@ from PyQt5.QtCore import (
     QTimer
 )
 
-def human_like_move(x, y, duration):
-    """마우스를 자연스럽게 (x, y)로 이동시키는 함수.
-    여러 단계로 선형 보간하여 이동합니다.
-    랜덤 지터 없이 일정한 경로로 이동합니다.
-    """
-    start_x, start_y = pyautogui.position()
-    steps = max(10, int(duration * 20))
-    for step in range(steps):
-        fraction = (step + 1) / steps
-        inter_x = start_x + (x - start_x) * fraction
-        inter_y = start_y + (y - start_y) * fraction
-        pyautogui.moveTo(inter_x, inter_y, duration=duration/steps)
-    pyautogui.moveTo(x, y, duration=0.05)
-
 #########################################
-# 초기 클릭 좌표 기록 스레드
+# 랜덤클릭 할 부분 17군데 지정 
 #########################################
 class InitialClickRecorderThread(QThread):
     recorded_signal = pyqtSignal(list)  # 기록된 17개 좌표 리스트 전달
     message_signal = pyqtSignal(str)
     
     def run(self):
-        self.message_signal.emit("초기 17회 클릭: 화면에서 원하는 좌표를 클릭하세요.")
+        self.message_signal.emit("마우스 17회 클릭: 화면에서 원하는 좌표를 클릭하세요.")
         self.clicks = []
         def on_click(x, y, button, pressed):
             if pressed:
@@ -51,7 +38,9 @@ class InitialClickRecorderThread(QThread):
         self.recorded_signal.emit(self.clicks)
 
 #########################################
-# 랜덤 클릭 스레드 (기록된 17개 좌표 기반 부드러운 이동 및 클릭 + 매 회 색상 감지)
+# 랜덤 클릭 및 마우스 휘갈겨 스레드 
+# (기록된 좌표 기반 부드러운 이동 및 클릭, 
+#  일정 확률로 휘갈겨 동작 수행 + 매 회 색상 감지)
 #########################################
 class RandomClickThread(QThread):
     log_signal = pyqtSignal(str)
@@ -75,18 +64,36 @@ class RandomClickThread(QThread):
                 self.pause_condition.wait(self.mutex)
             self.mutex.unlock()
             try:
+                # 초기 좌표 중 하나를 선택 후 개선된 오프셋 적용
                 coord = random.choice(self.coordinates)
-                # 좌표에 약간의 오프셋 추가 (클릭 대상은 그대로 자연스럽게 이동)
-                jittered_coord = (coord[0] + random.randint(-2, 2), coord[1] + random.randint(-2, 2))
-                human_like_move(jittered_coord[0], jittered_coord[1], duration=random.uniform(0.1, 0.2))
-                pyautogui.click()
-                self.log_signal.emit(f"랜덤 클릭: {jittered_coord}")
+                # 90% 확률로 ±3, 17% 확률로 ±5 범위의 오프셋 적용
+                offset_range = 3 if random.random() >= 0.17 else 5
+                offset_x = random.randint(-offset_range, offset_range)
+                offset_y = random.randint(-offset_range, offset_range)
+                adjusted_coord = (coord[0] + offset_x, coord[1] + offset_y)
+                
+                # 랜덤 확률로 클릭 대신 휘갈겨 동작 수행 (예: 4% 확률)
+                if random.random() < 0.04:
+                    self.scribble_mouse(adjusted_coord)
+                    self.log_signal.emit("마우스 휘갈겨 실행: " + str(adjusted_coord))
+                else:
+                    pyautogui.moveTo(adjusted_coord[0], adjusted_coord[1],
+                                     duration=0.13, tween=pyautogui.easeInOutQuad)
+                    pyautogui.click()
+                    self.log_signal.emit(f"랜덤 클릭: {adjusted_coord} (원래 좌표: {coord}, 오프셋: ({offset_x}, {offset_y}))")
             except Exception as e:
-                self.log_signal.emit("랜덤 클릭 오류: " + str(e))
-            # 랜덤 딜레이 0.1 ~ 0.2초 적용
-            time.sleep(random.uniform(0.1, 0.2))
+                self.log_signal.emit("랜덤 클릭/휘갈겨 오류: " + str(e))
+                
+            # 다양화된 랜덤 딜레이 적용
+            try:
+                base_delay = random.uniform(0.11, 0.2)
+                if random.random() < 0.15:  # 15% 확률로 추가 딜레이
+                    base_delay += random.uniform(0.2, 0.5)
+                time.sleep(base_delay)
+            except Exception as e:
+                self.log_signal.emit("딜레이 적용 오류: " + str(e))
             
-            # --- 매 회 랜덤 클릭 후 지정 영역에서 타겟 색상 감지 ---
+            # --- 매 회 랜덤 클릭/휘갈겨 후 지정 영역에서 타겟 색상 감지 ---
             try:
                 screenshot = pyautogui.screenshot(region=self.region)
                 img = np.array(screenshot)
@@ -107,10 +114,31 @@ class RandomClickThread(QThread):
                     detected_coord = (self.region[0] + x, self.region[1] + y)
                     self.log_signal.emit(f"랜덤 클릭 스레드 내 색상 감지됨: {detected_coord}")
                     self.detection_signal.emit(detected_coord)
-                    self.pause()  # 감지 후 일시정지 (자동 감지로 인한 일시정지)
+                    self.pause()  # 감지 후 일시정지
                     time.sleep(1)  # 중복 감지 방지를 위한 잠시 대기
             except Exception as e:
                 self.log_signal.emit("색상 감지 오류: " + str(e))
+    
+    def scribble_mouse(self, start_coord, scribble_count=10, scribble_range=23, speed=1500):
+        """
+        start_coord를 시작점으로, 지정 범위 내에서 부드럽고 빠르게 마우스를 이동(휘갈겨)함.
+        'speed'는 픽셀/초 단위로 이동 속도를 결정합니다.
+        """
+        # 현재 위치에서 시작 좌표까지 부드럽게 이동
+        current_pos = pyautogui.position()
+        dist = math.hypot(start_coord[0] - current_pos[0], start_coord[1] - current_pos[1])
+        duration = dist / speed if speed > 0 else 0.1
+        pyautogui.moveTo(start_coord[0], start_coord[1], duration=duration, tween=pyautogui.easeInOutQuad)
+        
+        # 지정한 횟수만큼 무작위 좌표로 부드럽게 이동
+        for _ in range(scribble_count):
+            offset_x = random.randint(-scribble_range, scribble_range)
+            offset_y = random.randint(-scribble_range, scribble_range)
+            new_coord = (start_coord[0] + offset_x, start_coord[1] + offset_y)
+            current_pos = pyautogui.position()
+            dist = math.hypot(new_coord[0] - current_pos[0], new_coord[1] - current_pos[1])
+            duration = dist / speed if speed > 0 else 0.05
+            pyautogui.moveTo(new_coord[0], new_coord[1], duration=duration, tween=pyautogui.easeInOutQuad)
 
     def pause(self):
         self.mutex.lock()
@@ -172,7 +200,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("감시 프로그램")
         self.resize(450, 500)
 
-        # 설정 파일(config.json)에서 감시 영역을 로드 (없으면 기본값 사용)
+        # 설정 파일(config.json)에서 감시 영역 로드 (없으면 기본값 사용)
         try:
             with open("config.json", "r") as f:
                 config = json.load(f)
@@ -200,7 +228,7 @@ class MainWindow(QMainWindow):
         self.layout.addWidget(self.button_pick_color)
         self.button_pick_color.clicked.connect(self.start_color_picker)
 
-        # 수동 일시정지 해제용 버튼 (우클릭으로 자동화 일시정지 시 활성화)
+        # 수동 일시정지 해제용 버튼 (우클릭 시 자동화 일시정지 시 활성화)
         self.button_resume = QPushButton("자동화 재개")
         self.layout.addWidget(self.button_resume)
         self.button_resume.clicked.connect(self.resume_automation)
@@ -254,7 +282,7 @@ class MainWindow(QMainWindow):
             return
         self.target_color = target_color
         self.log_message(f"감시 영역: {self.monitoring_region} / 감시 시작!")
-        # 초기 17회 클릭 좌표를 기록하도록 사용자에게 유도
+        # 초기 17회 클릭 좌표를 기록하도록 사용자 유도
         self.initial_click_coords = []
         self.initial_click_thread = InitialClickRecorderThread()
         self.initial_click_thread.message_signal.connect(self.log_message)
@@ -285,20 +313,26 @@ class MainWindow(QMainWindow):
         self.perform_detection_click(detected_coord)
 
     def perform_detection_click(self, detected_coord):
-        # 감지된 좌표에서 (5, 5) 오프셋과 추가 랜덤 오프셋을 적용
-        adjusted_coord = (
-            detected_coord[0] + 5 + random.randint(-3, 3),
-            detected_coord[1] + 5 + random.randint(-3, 3)
-        )
-        QTimer.singleShot(0, lambda: self.safe_click(adjusted_coord, 0.17, "감지 좌표(오프셋 및 랜덤 적용) 클릭 완료"))
-        # (850,676) 좌표에도 약간의 랜덤 오프셋 적용
-        target_coord = (850 + random.randint(-5, 5), 676 + random.randint(-5, 5))
+        # 감지된 좌표에 기본 오프셋 및 추가 랜덤 오프셋 적용
+        base_offset_x = 5 + random.randint(-1, 1)
+        base_offset_y = 5 + random.randint(-1, 1)
+        offset_range = 3 if random.random() >= 0.1 else 5
+        offset_x = random.randint(-offset_range, offset_range)
+        offset_y = random.randint(-offset_range, offset_range)
+        adjusted_coord = (detected_coord[0] + base_offset_x + offset_x,
+                          detected_coord[1] + base_offset_y + offset_y)
+        QTimer.singleShot(0, lambda: self.safe_click(adjusted_coord, 0.05, "감지 좌표(오프셋 및 랜덤 적용) 클릭 완료"))
+    
+        # (850, 676) 좌표에도 개선된 랜덤 오프셋 적용
+        target_offset_range = 5 if random.random() >= 0.1 else 7
+        target_coord = (850 + random.randint(-target_offset_range, target_offset_range),
+                        676 + random.randint(-target_offset_range, target_offset_range))
         QTimer.singleShot(200, lambda: self.safe_click(target_coord, 0.01, "(850,676) 좌표(랜덤 적용) 클릭 완료"))
-        # 감지 후 자동 재개 없이 그대로 일시정지 상태 유지 (재개는 '자동화 재개' 버튼을 통해 진행)
+        # 감지 후 자동 재개 타이머 없이 그대로 일시정지 (재개는 '자동화 재개' 버튼으로 진행)
 
     def safe_click(self, coord, duration, message):
         try:
-            human_like_move(coord[0], coord[1], duration=duration)
+            pyautogui.moveTo(coord[0], coord[1], duration=duration, tween=pyautogui.easeInOutQuad)
             pyautogui.click()
             self.log_message(message)
         except Exception as e:
