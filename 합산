@@ -171,6 +171,7 @@ def generate_html_report(start_date: str, end_date: str, users: dict, all_users:
     """
     total_articles = sum(d["article"] for d in users.values())
     total_replies = sum(d["reply"] for d in users.values())
+    total_users = len(users)  # 전체 사용자 수 계산
     
     lines = [
         "<html>",
@@ -181,7 +182,8 @@ def generate_html_report(start_date: str, end_date: str, users: dict, all_users:
         '<body style="font-size:12px; font-family: sans-serif;">',
         f"    <p>집계 기간 : {start_date} ~ {end_date}</p>",
         "    <p>(글+3점, 댓글+1점)</p>",
-        f"    <p>총 글 수: {total_articles}개, 총 댓글 수: {total_replies}개</p>"
+        f"    <p>총 글 수: {total_articles}개, 총 댓글 수: {total_replies}개</p>",
+        f"    <p>총 사용자 수: {total_users}명</p>"
     ]
     
     for rank_val, uid, d in all_users:
