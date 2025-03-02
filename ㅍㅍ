@@ -1,0 +1,263 @@
+import asyncio
+import logging
+import pickle
+import hashlib
+from datetime import datetime, timedelta, timezone
+
+import aiofiles
+import dc_api
+
+# 만약 보안상의 이유로 pickle 대신 JSON 등 안전한 포맷 사용을 고려한다면,
+# 아래와 같이 커스텀 JSON 인코더를 정의할 수 있습니다.
+import json
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
+# 표준 로깅 모듈 설정: 로그 레벨, 포맷, 날짜 포맷 등을 지정합니다.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+def generate_unique_id(doc):
+    """
+    문서(doc)에 대해 고유 식별자를 생성합니다.
+    - doc.id가 존재하면 이를 문자열로 반환합니다.
+    - 그렇지 않으면, doc.author, doc.time, doc.author_id와 선택적으로
+      doc.content, doc.title 등의 속성을 조합하여 SHA256 해시를 생성합니다.
+    """
+    if hasattr(doc, 'id') and doc.id is not None:
+        return str(doc.id)
+    else:
+        base_str = f"{doc.author}_{doc.time}_{doc.author_id}"
+        if hasattr(doc, 'content') and doc.content:
+            base_str += f"_{doc.content}"
+        if hasattr(doc, 'title') and doc.title:
+            base_str += f"_{doc.title}"
+        return hashlib.sha256(base_str.encode('utf-8')).hexdigest()
+
+async def safe_get_document(index, retries=10, delay=0.2):
+    """
+    문서를 가져올 때 네트워크나 I/O 관련 구체적 예외를 포함하여 재시도합니다.
+    재시도 시 지수 백오프를 적용합니다.
+    """
+    for attempt in range(retries):
+        try:
+            doc = await index.document()
+            if doc is not None:
+                return doc
+        except (IOError, ConnectionError) as e:
+            logger.warning(f"[게시글 집계 재시도 {attempt+1}/{retries}] 네트워크/IO 오류 발생: {e}")
+        except Exception as e:
+            logger.exception(f"[게시글 집계 재시도 {attempt+1}/{retries}] 문서 가져오기 예외 (문서ID 미확인): {e}")
+        await asyncio.sleep(delay * (2 ** attempt))
+    logger.error("[안전 재시도 실패] 문서 가져오기에 실패하였습니다.")
+    return None
+
+async def safe_iterate_comments(index, retries=10, delay=0.2):
+    """
+    댓글을 가져올 때 네트워크/IO 관련 예외를 포함하여 재시도합니다.
+    재시도 시 지수 백오프를 적용합니다.
+    """
+    for attempt in range(retries):
+        try:
+            async for comm in index.comments():
+                yield comm
+            return  # 정상적으로 댓글을 순회한 경우 함수 종료
+        except (IOError, ConnectionError) as e:
+            logger.warning(f"[댓글 집계 재시도 {attempt+1}/{retries}] 네트워크/IO 오류 발생: {e}")
+        except Exception as e:
+            logger.exception(f"[댓글 집계 재시도 {attempt+1}/{retries}] 댓글 가져오기 예외: {e}")
+        await asyncio.sleep(delay * (2 ** attempt))
+    logger.error("[안전 재시도 실패] 댓글 가져오기에 실패하였습니다.")
+
+def get_doc_time_utc(doc_time):
+    """
+    doc_time이 naive하면 UTC로 간주하고 tzinfo가 없으면 강제로 UTC로 설정합니다.
+    tzinfo가 있는 경우에는 UTC로 변환합니다.
+    """
+    if doc_time.tzinfo is None:
+        return doc_time.replace(tzinfo=timezone.utc)
+    else:
+        return doc_time.astimezone(timezone.utc)
+
+async def process_post(index, rank, data, processed_article_ids):
+    """
+    하나의 게시글(문서)을 처리합니다.
+    처리 결과에 따라 아래 상태값을 반환합니다.
+      - "in_range": 지정한 범위 내의 게시글 (정상 처리)
+      - "skip": 중복이거나, 아직 처리 대상이 아닌 게시글 (예: 미래의 글)
+      - "old": 지정 범위 이전의 게시글 (범위 외)
+    에러 발생 시, 게시글의 고유 ID(article_uid)를 포함하여 추가적인 컨텍스트를 로그에 기록합니다.
+    """
+    # 1. 문서 가져오기 (안전 재시도 적용)
+    doc = await safe_get_document(index)
+    if doc is None:
+        return "skip"
+    
+    article_uid = generate_unique_id(doc)
+    if article_uid in processed_article_ids:
+        logger.info(f"중복 글 발견: {article_uid} 집계 제외")
+        return "skip"
+    processed_article_ids.add(article_uid)
+    
+    # 집계 대상 기간 설정 (2025년 1월 1일 ~ 2025년 2월 1일 UTC)
+    target_start = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    target_end = datetime(2025, 2, 1, tzinfo=timezone.utc)
+    try:
+        doc_time = get_doc_time_utc(doc.time)
+    except Exception as e:
+        logger.exception(f"[시간 파싱 오류] 게시글 {article_uid} 처리 중 오류: {e}")
+        return "skip"
+    
+    if doc_time > target_end:
+        return "skip"
+    if doc_time < target_start:
+        logger.info(f"[범위 외] {doc_time}은(는) 집계 대상 범위({target_start} 이상)보다 이전입니다.")
+        return "old"
+    
+    # 4. 전역 게시글 카운트 업데이트 및 중간 저장 (10번째마다)
+    data['global_count'] = data.get('global_count', 0) + 1
+    if data['global_count'] % 10 == 0:
+        elapsed_minutes = (datetime.now(timezone.utc) - data['start_time']).total_seconds() / 60.0
+        logger.info(f"[중간 저장] {doc.time} | 집계 시간 경과: {elapsed_minutes:.2f} 분")
+        data['rank'] = rank
+        try:
+            # 비동기 파일 I/O (aiofiles)를 이용해 중간 저장하여 이벤트 루프 블로킹 최소화
+            async with aiofiles.open('data.pickle', 'wb') as fw:
+                await fw.write(pickle.dumps(data))
+        except (IOError, OSError) as e:
+            logger.error(f"[파일 저장 오류] 중간 저장 실패 (게시글 {article_uid}): {e}")
+    
+    # 5. 집계 기간 업데이트
+    if data.get('start_date') is None or doc_time < data['start_date']:
+        data['start_date'] = doc_time
+    if data.get('end_date') is None or doc_time > data['end_date']:
+        data['end_date'] = doc_time
+    
+    # 6. 게시글 작성자 집계
+    try:
+        writer = doc.author if doc.author_id is None else f"{doc.author}({doc.author_id})"
+        if writer in rank:
+            rank[writer]['article'] += 1
+        else:
+            rank[writer] = {"article": 1, "reply": 0}
+    except Exception as e:
+        logger.exception(f"[게시글 집계 오류] 게시글 {article_uid} 처리 중 오류: {e}")
+    
+    # 7. 댓글 집계 (재시도 및 중복 방지 적용)
+    try:
+        processed_comment_ids = set()
+        async for comm in safe_iterate_comments(index):
+            try:
+                unique_id = comm.id if hasattr(comm, 'id') and comm.id is not None else \
+                            (comm.author, getattr(comm, 'content', None), getattr(comm, 'time', None))
+                if unique_id in processed_comment_ids:
+                    continue
+                processed_comment_ids.add(unique_id)
+                
+                writer = comm.author if comm.author_id is None else f"{comm.author}({comm.author_id})"
+                if writer in rank:
+                    rank[writer]['reply'] += 1
+                else:
+                    rank[writer] = {"article": 0, "reply": 1}
+            except Exception as e:
+                logger.exception(f"[댓글 집계 오류] 게시글 {article_uid}의 댓글 처리 중 오류: {e}")
+    except Exception as e:
+        logger.exception(f"[댓글 처리 최종 오류] 게시글 {article_uid}에서 댓글 처리 중 오류: {e}")
+        await asyncio.sleep(0.01)
+    
+    return "in_range"
+
+async def process_post_with_semaphore(semaphore, index, rank, data, processed_article_ids):
+    """
+    동시성 제한을 위한 semaphore를 이용하여 게시글 처리를 병렬로 수행합니다.
+    """
+    async with semaphore:
+        return await process_post(index, rank, data, processed_article_ids)
+
+async def run():
+    """
+    메인 함수:
+    - dc_api를 통해 지정된 게시판의 게시글들을 순회하며 처리합니다.
+    - 게시글 및 댓글 집계를 진행하고, 중간 저장과 최종 저장을 비동기 파일 I/O로 수행합니다.
+    - asyncio의 동시성 제한(semaphore)과 asyncio.gather를 활용하여 병렬 처리합니다.
+    - 연속 범위 외 게시글(OLD)이 일정 횟수 이상 발생하면 크롤링을 중단합니다.
+    """
+    data = {
+        'start_date': None,
+        'end_date': None,
+        'date': datetime.now(timezone.utc),
+        'global_count': 0,
+        'start_time': datetime.now(timezone.utc)
+    }
+    rank = {}
+    processed_article_ids = set()
+    consecutive_old_count = 0
+    OLD_THRESHOLD = 20  # 연속 범위 외 게시글 임계치
+    
+    semaphore = asyncio.Semaphore(5)  # 동시 처리 작업 수 제한
+    tasks = []
+    
+    async with dc_api.API() as api:
+        async for index in api.board(board_id="illit", is_minor=True, start_page=1558):
+            # 동시성 제한을 적용하여 게시글 처리 작업 생성
+            task = asyncio.create_task(
+                process_post_with_semaphore(semaphore, index, rank, data, processed_article_ids)
+            )
+            tasks.append(task)
+            
+            # 일정 배치 크기(예: 10개)마다 결과를 모아서 연속 범위 외 게시글 여부를 확인
+            if len(tasks) >= 10:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+                for status in results:
+                    if status == "old":
+                        consecutive_old_count += 1
+                        if consecutive_old_count >= OLD_THRESHOLD:
+                            logger.info(f"연속 {OLD_THRESHOLD}개 이상의 범위 외 게시글이 발견되어 크롤링을 중단합니다.")
+                            # 남은 작업 취소
+                            for t in tasks:
+                                t.cancel()
+                            break
+                    else:
+                        consecutive_old_count = 0
+                if consecutive_old_count >= OLD_THRESHOLD:
+                    break
+        
+        # 남은 작업 처리
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for status in results:
+                if status == "old":
+                    consecutive_old_count += 1
+                else:
+                    consecutive_old_count = 0
+    
+    # 유효 게시글이 없을 경우 fallback 집계 기간 사용
+    if data.get('start_date') is None:
+        logger.info("유효한 게시글이 없습니다. fallback 집계 기간 사용")
+        data['start_date'] = data['date'] - timedelta(days=1)
+        data['end_date'] = data['date']
+    
+    data['rank'] = rank
+    try:
+        # 최종 저장 시에도 aiofiles를 이용하여 비동기 파일 I/O 처리
+        async with aiofiles.open('data.pickle', 'wb') as fw:
+            await fw.write(pickle.dumps(data))
+    except (IOError, OSError) as e:
+        logger.error(f"[파일 저장 오류] 최종 저장 실패: {e}")
+    
+    logger.info("최종 집계 날짜")
+    logger.info(f"start_date: {data['start_date']}")
+    logger.info(f"end_date:   {data['end_date']}")
+    logger.info(data)
+    input("종료하려면 Enter 키를 누르세요.")
+
+if __name__ == '__main__':
+    asyncio.run(run())
