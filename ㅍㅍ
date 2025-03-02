@@ -7,15 +7,6 @@ from datetime import datetime, timedelta, timezone
 import aiofiles
 import dc_api
 
-# 만약 보안상의 이유로 pickle 대신 JSON 등 안전한 포맷 사용을 고려한다면,
-# 아래와 같이 커스텀 JSON 인코더를 정의할 수 있습니다.
-import json
-class DateTimeEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
-
 # 표준 로깅 모듈 설정: 로그 레벨, 포맷, 날짜 포맷 등을 지정합니다.
 logging.basicConfig(
     level=logging.INFO,
@@ -128,7 +119,6 @@ async def process_post(index, rank, data, processed_article_ids):
         logger.info(f"[중간 저장] {doc.time} | 집계 시간 경과: {elapsed_minutes:.2f} 분")
         data['rank'] = rank
         try:
-            # 비동기 파일 I/O (aiofiles)를 이용해 중간 저장하여 이벤트 루프 블로킹 최소화
             async with aiofiles.open('data.pickle', 'wb') as fw:
                 await fw.write(pickle.dumps(data))
         except (IOError, OSError) as e:
@@ -174,19 +164,11 @@ async def process_post(index, rank, data, processed_article_ids):
     
     return "in_range"
 
-async def process_post_with_semaphore(semaphore, index, rank, data, processed_article_ids):
-    """
-    동시성 제한을 위한 semaphore를 이용하여 게시글 처리를 병렬로 수행합니다.
-    """
-    async with semaphore:
-        return await process_post(index, rank, data, processed_article_ids)
-
 async def run():
     """
     메인 함수:
-    - dc_api를 통해 지정된 게시판의 게시글들을 순회하며 처리합니다.
+    - dc_api를 통해 지정된 게시판의 게시글들을 순차적으로 순회하며 처리합니다.
     - 게시글 및 댓글 집계를 진행하고, 중간 저장과 최종 저장을 비동기 파일 I/O로 수행합니다.
-    - asyncio의 동시성 제한(semaphore)과 asyncio.gather를 활용하여 병렬 처리합니다.
     - 연속 범위 외 게시글(OLD)이 일정 횟수 이상 발생하면 크롤링을 중단합니다.
     """
     data = {
@@ -200,59 +182,30 @@ async def run():
     processed_article_ids = set()
     consecutive_old_count = 0
     OLD_THRESHOLD = 20  # 연속 범위 외 게시글 임계치
-    
-    semaphore = asyncio.Semaphore(5)  # 동시 처리 작업 수 제한
-    tasks = []
-    
+
     async with dc_api.API() as api:
         async for index in api.board(board_id="illit", is_minor=True, start_page=1558):
-            # 동시성 제한을 적용하여 게시글 처리 작업 생성
-            task = asyncio.create_task(
-                process_post_with_semaphore(semaphore, index, rank, data, processed_article_ids)
-            )
-            tasks.append(task)
-            
-            # 일정 배치 크기(예: 10개)마다 결과를 모아서 연속 범위 외 게시글 여부를 확인
-            if len(tasks) >= 10:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                tasks = []
-                for status in results:
-                    if status == "old":
-                        consecutive_old_count += 1
-                        if consecutive_old_count >= OLD_THRESHOLD:
-                            logger.info(f"연속 {OLD_THRESHOLD}개 이상의 범위 외 게시글이 발견되어 크롤링을 중단합니다.")
-                            # 남은 작업 취소
-                            for t in tasks:
-                                t.cancel()
-                            break
-                    else:
-                        consecutive_old_count = 0
+            status = await process_post(index, rank, data, processed_article_ids)
+            if status == "old":
+                consecutive_old_count += 1
                 if consecutive_old_count >= OLD_THRESHOLD:
+                    logger.info(f"연속 {OLD_THRESHOLD}개 이상의 범위 외 게시글이 발견되어 크롤링을 중단합니다.")
                     break
-        
-        # 남은 작업 처리
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for status in results:
-                if status == "old":
-                    consecutive_old_count += 1
-                else:
-                    consecutive_old_count = 0
-    
-    # 유효 게시글이 없을 경우 fallback 집계 기간 사용
+            else:
+                consecutive_old_count = 0
+
     if data.get('start_date') is None:
         logger.info("유효한 게시글이 없습니다. fallback 집계 기간 사용")
         data['start_date'] = data['date'] - timedelta(days=1)
         data['end_date'] = data['date']
-    
+
     data['rank'] = rank
     try:
-        # 최종 저장 시에도 aiofiles를 이용하여 비동기 파일 I/O 처리
         async with aiofiles.open('data.pickle', 'wb') as fw:
             await fw.write(pickle.dumps(data))
     except (IOError, OSError) as e:
         logger.error(f"[파일 저장 오류] 최종 저장 실패: {e}")
-    
+
     logger.info("최종 집계 날짜")
     logger.info(f"start_date: {data['start_date']}")
     logger.info(f"end_date:   {data['end_date']}")
